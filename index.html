@@ -48,8 +48,7 @@ td.num,th.num{text-align:right;white-space:nowrap}
 function showDiag(t){
   let d=document.getElementById("diag");
   if(!d){d=document.createElement("pre");d.id="diag";d.style.cssText="position:fixed;top:0;left:0;right:0;margin:0;padding:10px;background:#fff3cd;color:#000;font:13px monospace;white-space:pre-wrap;z-index:99";document.body.appendChild(d);}
-  d.textContent+=t+"
-";
+  d.textContent+=t+"\n";
 }
 window.addEventListener("error",e=>{
   const who=(e.target&&e.target.src)?"Failed to load: "+e.target.src:(e.message||"Script error");
@@ -124,4 +123,482 @@ setTimeout(()=>{
           <label class="wide">Notes<textarea id="fNotes" rows="2"></textarea></label>
         </div>
         <p class="hint" id="priceHint"></p>
-        
+        <div class="row" style="margin-top:12px">
+          <button class="pri" id="saveBtn">Save item</button>
+          <button id="regenBtn">Rebuild title</button>
+          <button id="cancelBtn">Cancel</button>
+          <span style="flex:1"></span>
+          <button class="danger" id="delBtn" hidden>Delete</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="v-inv" hidden>
+      <div class="card"><div class="stats" id="summary"></div></div>
+      <div class="card">
+        <div class="row">
+          <input id="search" placeholder="Search title, tag, UPC, bin…" style="flex:2;min-width:180px">
+          <select id="statusFilter" style="flex:1;min-width:140px"></select>
+          <button class="pri" id="printBtn">Print labels for checked</button>
+        </div>
+        <p class="hint" id="invCount"></p>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th></th><th>Tag</th><th>Item</th><th class="num">Qty</th><th class="num">Price</th><th>Status</th><th></th></tr></thead>
+            <tbody id="invBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="v-settings" hidden>
+      <div class="card">
+        <h2 style="font-size:1.1rem">Flat price by MSRP</h2>
+        <p class="hint">An item whose MSRP is at or under a line gets that line's flat price. Leave "Up to" blank on the last line to catch everything above. New items use these prices. Items you already saved keep their prices.</p>
+        <div id="tierRows" style="margin-top:12px"></div>
+        <div class="row">
+          <button id="addTier">+ Add line</button>
+          <button class="pri" id="saveTiers">Save prices</button>
+        </div>
+      </div>
+      <div class="card">
+        <button class="danger" id="logoutBtn">Sign out</button>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"></script>
+<script>
+/* PASTE YOUR FIREBASE SETTINGS HERE (from the setup steps) */
+const firebaseConfig = {
+  apiKey: "AIzaSyCEp4ZNQ8MuR6gjN_85PCEt7YBzOaLQovY",
+  authDomain: "rr-home-goods.firebaseapp.com",
+  projectId: "rr-home-goods",
+  storageBucket: "rr-home-goods.firebasestorage.app",
+  messagingSenderId: "292941889480",
+  appId: "1:292941889480:web:e8440dcd53401477324afd"
+};
+const CONFIGURED = !firebaseConfig.apiKey.startsWith("PASTE");
+
+const CATS = ["Kitchen & Dining","Small Appliances","Home Decor","Bedding & Bath","Furniture","Tools & Hardware","Electronics","Toys & Games","Clothing & Shoes","Health & Beauty","Baby","Pet Supplies","Outdoor & Garden","Sports & Fitness","Office & School","Automotive","Seasonal","Other"];
+const CONDS = [["N","New (sealed)","New"],["NO","New (open box)","New Open Box"],["LN","Used - like new","Used Like New"],["UG","Used - good","Used"],["UF","Used - fair","Used"],["P","For parts / not working","For Parts"]];
+const STATUSES = [["ready","Ready to list"],["listed","Listed"],["sold","Sold"],["gone","Donate / trash"]];
+const STATUS_LABEL = Object.fromEntries(STATUSES);
+const DEFAULT_TIERS = [{max:25,price:5},{max:50,price:10},{max:100,price:20},{max:200,price:35},{max:400,price:60},{max:99999,price:90}];
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const money = n => (n == null || isNaN(n)) ? "—" : "$" + Number(n).toFixed(2);
+const numOrNull = v => { const n = parseFloat(v); return isNaN(n) ? null : n; };
+
+let db, auth;
+let items = [];
+let settings = { tiers: DEFAULT_TIERS };
+let editingSku = null;
+let priceTouched = false;
+let titleTouched = false;
+const picked = new Set();
+let unsubItems = null, unsubSettings = null;
+
+function toast(msg) {
+  const t = $("toast");
+  t.textContent = msg; t.hidden = false;
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => t.hidden = true, 2800);
+}
+
+function setSelect(el, opts, selected) {
+  el.innerHTML = opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("");
+  if (selected != null) el.value = selected;
+}
+
+function liquidPrice(msrp) {
+  if (msrp == null) return null;
+  for (const t of settings.tiers) if (msrp <= t.max) return t.price;
+  return null;
+}
+
+function buildTitle(d) {
+  const cw = (CONDS.find(c => c[0] === d.cond) || [])[2] || "";
+  let t = [d.brand, d.model, d.type, d.keywords, cw]
+    .map(x => (x || "").trim()).filter(Boolean).join(" ").replace(/\s+/g, " ");
+  if (t.length > 80) {
+    t = t.slice(0, 80);
+    const i = t.lastIndexOf(" ");
+    if (i > 0) t = t.slice(0, i);
+  }
+  return t;
+}
+function titleInputs() {
+  return { brand: $("fBrand").value, model: $("fModel").value, type: $("fType").value,
+           keywords: $("fKeywords").value, cond: $("fCond").value };
+}
+function updateTitleCount() { $("titleCount").textContent = `${$("fTitle").value.length}/80`; }
+function regenTitle() {
+  $("fTitle").value = buildTitle(titleInputs());
+  titleTouched = false;
+  updateTitleCount();
+}
+function updatePriceHint() {
+  const m = numOrNull($("fMsrp").value);
+  const p = liquidPrice(m);
+  $("priceHint").textContent = m == null
+    ? "Enter the MSRP and the flat price fills in automatically."
+    : `Flat price for this MSRP: ${money(p)}. Type a different price to override it.`;
+}
+
+function readForm() {
+  return {
+    brand: $("fBrand").value.trim(), model: $("fModel").value.trim(),
+    type: $("fType").value.trim(), keywords: $("fKeywords").value.trim(),
+    cond: $("fCond").value, category: $("fCat").value,
+    msrp: numOrNull($("fMsrp").value), price: numOrNull($("fPrice").value),
+    qty: Math.max(1, parseInt($("fQty").value, 10) || 1),
+    pallet: $("fPallet").value.trim(), bin: $("fBin").value.trim(),
+    status: $("fStatus").value, soldPrice: numOrNull($("fSold").value),
+    upc: $("fUpc").value.trim(), title: $("fTitle").value.trim(), notes: $("fNotes").value.trim()
+  };
+}
+
+function showView(name) {
+  ["scan", "inv", "settings"].forEach(v => $("v-" + v).hidden = v !== name);
+  document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.view === name));
+  if (name === "scan") $("scanBox").focus();
+  if (name === "inv") renderInv();
+}
+
+function openEditor(item, pre = {}) {
+  editingSku = item ? item.sku : null;
+  const d = item || pre;
+  $("fBrand").value = d.brand || "";
+  $("fModel").value = d.model || "";
+  $("fType").value = d.type || "";
+  $("fKeywords").value = d.keywords || "";
+  $("fCond").value = d.cond || "N";
+  $("fCat").value = d.category || "Other";
+  $("fMsrp").value = d.msrp ?? "";
+  $("fPrice").value = d.price ?? "";
+  $("fQty").value = d.qty || 1;
+  $("fPallet").value = d.pallet || localStorage.getItem("rr_pallet") || "";
+  $("fBin").value = d.bin || "";
+  $("fStatus").value = d.status || "ready";
+  $("fSold").value = d.soldPrice ?? "";
+  $("fUpc").value = d.upc || "";
+  $("fNotes").value = d.notes || "";
+  const built = buildTitle(titleInputs());
+  $("fTitle").value = (item && d.title) ? d.title : built;
+  titleTouched = !!(item && d.title && d.title !== built);
+  priceTouched = !!(item && d.price != null && d.price !== liquidPrice(d.msrp));
+  $("edTitle").textContent = item ? "Edit item" : "New item";
+  $("edSku").textContent = item ? item.sku : "Tag number assigned on save";
+  $("delBtn").hidden = !item;
+  $("editor").hidden = false;
+  updateTitleCount();
+  updatePriceHint();
+  showView("scan");
+  $("editor").scrollIntoView({ behavior: "smooth" });
+  $("fBrand").focus();
+}
+
+function closeEditor() {
+  $("editor").hidden = true;
+  editingSku = null;
+  $("scanBox").focus();
+}
+
+function handleScan(code) {
+  const up = code.toUpperCase();
+  const hit = items.find(i => i.sku === up) || items.find(i => i.upc && i.upc === code);
+  if (hit) {
+    openEditor(hit);
+    toast(`Found ${hit.sku}`);
+  } else {
+    openEditor(null, { upc: code });
+    toast("New item. Fill in brand and item type.");
+  }
+}
+
+async function nextSku() {
+  const ref = db.collection("config").doc("counter");
+  return db.runTransaction(async tx => {
+    const s = await tx.get(ref);
+    const n = (s.exists ? s.data().n : 0) + 1;
+    tx.set(ref, { n });
+    return "HG-" + String(n).padStart(5, "0");
+  });
+}
+
+async function saveItem() {
+  const f = readForm();
+  if (!f.brand && !f.model && !f.type && !f.upc) {
+    toast("Add a brand, model, item type, or barcode first");
+    return;
+  }
+  if (!f.title) f.title = buildTitle(f);
+  if (f.price == null) f.price = liquidPrice(f.msrp);
+  if (f.status === "sold" && f.soldPrice == null) f.soldPrice = f.price;
+  const ts = firebase.firestore.FieldValue.serverTimestamp();
+  $("saveBtn").disabled = true;
+  try {
+    if (editingSku) {
+      await db.collection("items").doc(editingSku).set({ ...f, updated: ts }, { merge: true });
+      toast(`Saved ${editingSku}`);
+    } else {
+      const sku = await nextSku();
+      await db.collection("items").doc(sku).set({ ...f, sku, created: ts, updated: ts });
+      toast(`Saved as ${sku}`);
+    }
+    if (f.pallet) localStorage.setItem("rr_pallet", f.pallet);
+    closeEditor();
+  } catch (e) {
+    toast("Couldn't save: " + e.message);
+  } finally {
+    $("saveBtn").disabled = false;
+  }
+}
+
+async function markSold(sku) {
+  const it = items.find(i => i.sku === sku);
+  if (!it) return;
+  const ans = prompt("Sold for how much?", it.price ?? "");
+  if (ans === null) return;
+  try {
+    await db.collection("items").doc(sku).update({
+      status: "sold",
+      soldPrice: numOrNull(ans) ?? it.price,
+      updated: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    toast(`${sku} marked sold`);
+  } catch (e) {
+    toast("Couldn't update: " + e.message);
+  }
+}
+
+function renderInv() {
+  const q = $("search").value.trim().toLowerCase();
+  const st = $("statusFilter").value;
+  const rows = items
+    .filter(i => (!st || i.status === st) &&
+      (!q || [i.sku, i.title, i.brand, i.model, i.type, i.bin, i.upc, i.pallet]
+        .some(x => String(x || "").toLowerCase().includes(q))))
+    .sort((a, b) => b.sku.localeCompare(a.sku));
+  $("invBody").innerHTML = rows.map(i => `<tr>
+    <td><input type="checkbox" class="pick" data-sku="${esc(i.sku)}" ${picked.has(i.sku) ? "checked" : ""}></td>
+    <td class="mono">${esc(i.sku)}</td>
+    <td><b>${esc(i.title || "(no title)")}</b><div class="sub">${esc(i.pallet || "")}${i.bin ? " · bin " + esc(i.bin) : ""}</div></td>
+    <td class="num">${esc(i.qty || 1)}</td>
+    <td class="num"><b>${money(i.status === "sold" ? (i.soldPrice ?? i.price) : i.price)}</b><div class="sub">MSRP ${money(i.msrp)}</div></td>
+    <td>${esc(STATUS_LABEL[i.status] || i.status)}</td>
+    <td><button data-edit="${esc(i.sku)}">Edit</button> ${i.status !== "sold" ? `<button data-sold="${esc(i.sku)}">Sold</button>` : ""}</td>
+  </tr>`).join("") || `<tr><td colspan="7" class="sub">No items match.</td></tr>`;
+  $("invCount").textContent = `${rows.length} shown · ${picked.size} checked for labels`;
+}
+
+function renderSummary() {
+  const active = items.filter(i => i.status !== "sold" && i.status !== "gone");
+  const sold = items.filter(i => i.status === "sold");
+  const units = active.reduce((s, i) => s + (i.qty || 1), 0);
+  const atPrices = active.reduce((s, i) => s + (i.price || 0) * (i.qty || 1), 0);
+  const atMsrp = active.reduce((s, i) => s + (i.msrp || 0) * (i.qty || 1), 0);
+  const soldTotal = sold.reduce((s, i) => s + (i.soldPrice ?? i.price ?? 0), 0);
+  $("summary").innerHTML = [
+    ["Items on hand", active.length], ["Units on hand", units],
+    ["Value at your prices", money(atPrices)], ["Retail (MSRP) value", money(atMsrp)],
+    ["Sold total", money(soldTotal)]
+  ].map(([k, v]) => `<div><span class="sub">${k}</span><b>${v}</b></div>`).join("");
+}
+
+function printLabels() {
+  const sel = items.filter(i => picked.has(i.sku)).sort((a, b) => a.sku.localeCompare(b.sku));
+  if (!sel.length) { toast("Check items on the Inventory tab first"); return; }
+  if (typeof JsBarcode === "undefined") { toast("Barcode library didn't load. Check your internet."); return; }
+  const labels = sel.flatMap(i => Array.from({ length: Math.max(1, i.qty || 1) }, () => i));
+  const html = labels.map(i => {
+    const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    JsBarcode(s, i.sku, { format: "CODE128", displayValue: true, height: 26, width: 1.2, fontSize: 10, margin: 0 });
+    return `<div class="lbl">
+      <div class="t">${esc((i.title || "").slice(0, 50))}</div>
+      <div class="pr"><span>${money(i.price)}</span><small>MSRP ${money(i.msrp)}</small></div>
+      ${s.outerHTML}
+    </div>`;
+  }).join("");
+  const w = window.open("", "_blank");
+  if (!w) { toast("Pop-ups are blocked. Allow them for this site."); return; }
+  w.document.write(`<!doctype html><html><head><title>Labels</title><style>
+    @page{size:2.25in 1.25in;margin:0}
+    body{margin:0;font-family:Arial,sans-serif}
+    .lbl{width:2.25in;height:1.25in;padding:.06in .08in;display:flex;flex-direction:column;justify-content:space-between;overflow:hidden;page-break-after:always;break-after:page}
+    .lbl:last-child{page-break-after:auto;break-after:auto}
+    .t{font-size:8pt;font-weight:bold;line-height:1.1;max-height:2.2em;overflow:hidden}
+    .pr{display:flex;justify-content:space-between;align-items:baseline}
+    .pr span{font-size:15pt;font-weight:bold}
+    .pr small{font-size:7pt}
+    svg{width:100%;height:0.5in}
+  </style></head><body>${html}</body></html>`);
+  w.document.close();
+  setTimeout(() => w.print(), 400);
+}
+
+function renderTiers() {
+  $("tierRows").innerHTML = settings.tiers.map((t, ix) => `<div class="tier">
+    <label>Up to MSRP $<input type="number" step="0.01" data-k="max" value="${t.max >= 99999 ? "" : t.max}" placeholder="and up"></label>
+    <label>Flat price $<input type="number" step="0.01" data-k="price" value="${t.price}"></label>
+    <button data-del="${ix}">✕</button>
+  </div>`).join("");
+}
+function readTiers() {
+  const out = [];
+  document.querySelectorAll("#tierRows .tier").forEach(row => {
+    const max = parseFloat(row.querySelector('[data-k="max"]').value);
+    const price = parseFloat(row.querySelector('[data-k="price"]').value);
+    if (!isNaN(price)) out.push({ max: isNaN(max) ? 99999 : max, price });
+  });
+  return out.sort((a, b) => a.max - b.max);
+}
+
+async function saveTiers() {
+  const t = readTiers();
+  if (!t.length) { toast("Add at least one price line"); return; }
+  try {
+    await db.collection("config").doc("settings").set({ tiers: t }, { merge: true });
+    settings.tiers = t;
+    toast("Prices saved");
+    updatePriceHint();
+  } catch (e) {
+    toast("Couldn't save: " + e.message);
+  }
+}
+
+function startData() {
+  if (unsubItems) return;
+  unsubItems = db.collection("items").onSnapshot(snap => {
+    items = snap.docs.map(d => ({ ...d.data(), sku: d.id }));
+    renderInv();
+    renderSummary();
+  }, e => toast("Can't load items: " + e.message));
+  unsubSettings = db.collection("config").doc("settings").onSnapshot(s => {
+    const d = s.exists ? s.data() : null;
+    settings.tiers = (d && Array.isArray(d.tiers))
+      ? d.tiers.map(t => ({ max: +t.max, price: +t.price })).sort((a, b) => a.max - b.max)
+      : DEFAULT_TIERS;
+    renderTiers();
+    updatePriceHint();
+  }, e => toast("Can't load prices: " + e.message));
+}
+
+function stopData() {
+  if (unsubItems) { unsubItems(); unsubItems = null; }
+  if (unsubSettings) { unsubSettings(); unsubSettings = null; }
+  items = [];
+}
+
+/* ----- setup ----- */
+setSelect($("fCat"), CATS.map(c => [c, c]));
+setSelect($("fCond"), CONDS.map(c => [c[0], c[1]]));
+setSelect($("fStatus"), STATUSES);
+setSelect($("statusFilter"), [["", "All statuses"], ...STATUSES]);
+
+document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => showView(b.dataset.view));
+
+$("scanBox").addEventListener("keydown", e => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    const v = e.target.value.trim();
+    e.target.value = "";
+    if (v) handleScan(v);
+  }
+});
+
+["fBrand", "fModel", "fType", "fKeywords", "fCond"].forEach(id =>
+  $(id).addEventListener("input", () => {
+    if (!titleTouched) { $("fTitle").value = buildTitle(titleInputs()); updateTitleCount(); }
+  }));
+$("fTitle").addEventListener("input", () => { titleTouched = true; updateTitleCount(); });
+$("fMsrp").addEventListener("input", () => {
+  if (!priceTouched) {
+    const p = liquidPrice(numOrNull($("fMsrp").value));
+    $("fPrice").value = p == null ? "" : p.toFixed(2);
+  }
+  updatePriceHint();
+});
+$("fPrice").addEventListener("input", () => { priceTouched = true; updatePriceHint(); });
+
+$("saveBtn").onclick = saveItem;
+$("regenBtn").onclick = regenTitle;
+$("cancelBtn").onclick = closeEditor;
+$("delBtn").onclick = async () => {
+  if (!editingSku) return;
+  if (!confirm(`Delete ${editingSku}?`)) return;
+  try {
+    await db.collection("items").doc(editingSku).delete();
+    toast("Deleted");
+    closeEditor();
+  } catch (e) { toast("Couldn't delete: " + e.message); }
+};
+
+$("search").addEventListener("input", renderInv);
+$("statusFilter").addEventListener("change", renderInv);
+$("printBtn").onclick = printLabels;
+$("invBody").addEventListener("click", e => {
+  const ed = e.target.closest("[data-edit]");
+  const so = e.target.closest("[data-sold]");
+  if (ed) openEditor(items.find(i => i.sku === ed.dataset.edit));
+  if (so) markSold(so.dataset.sold);
+});
+$("invBody").addEventListener("change", e => {
+  if (e.target.classList.contains("pick")) {
+    const s = e.target.dataset.sku;
+    e.target.checked ? picked.add(s) : picked.delete(s);
+    renderInv();
+  }
+});
+
+$("addTier").onclick = () => {
+  settings.tiers = readTiers();
+  settings.tiers.push({ max: 0, price: 0 });
+  renderTiers();
+};
+$("tierRows").addEventListener("click", e => {
+  const del = e.target.closest("[data-del]");
+  if (!del) return;
+  settings.tiers = readTiers();
+  settings.tiers.splice(+del.dataset.del, 1);
+  renderTiers();
+});
+$("saveTiers").onclick = saveTiers;
+
+$("loginBtn").onclick = async () => {
+  try {
+    await auth.signInWithEmailAndPassword($("loginEmail").value.trim(), $("loginPass").value);
+  } catch (e) { toast(e.message); }
+};
+$("loginPass").addEventListener("keydown", e => { if (e.key === "Enter") $("loginBtn").click(); });
+$("logoutBtn").onclick = () => auth.signOut();
+
+function init() {
+  if (!CONFIGURED) { $("setupMsg").hidden = false; return; }
+  firebase.initializeApp(firebaseConfig);
+  auth = firebase.auth();
+  db = firebase.firestore();
+  auth.onAuthStateChanged(user => {
+    if (user) {
+      $("login").hidden = true;
+      $("app").hidden = false;
+      startData();
+    } else {
+      $("app").hidden = true;
+      $("login").hidden = false;
+      stopData();
+    }
+  });
+}
+init();
+</script>
+</body>
+</html>
