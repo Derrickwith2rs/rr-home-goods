@@ -153,6 +153,20 @@ setTimeout(()=>{
 
     <section id="v-settings" hidden>
       <div class="card">
+        <h2 style="font-size:1.1rem">How prices are set</h2>
+        <label>Pricing method<select id="priceMode">
+          <option value="pct">Percent of MSRP, by condition</option>
+          <option value="flat">Flat price by MSRP range</option>
+        </select></label>
+        <div class="row"><button class="pri" id="saveMode">Save method</button></div>
+      </div>
+      <div class="card" id="pctCard">
+        <h2 style="font-size:1.1rem">Percent of MSRP by condition</h2>
+        <p class="hint">Price = MSRP x the percent for the item's condition, rounded to the nearest dollar ($1 minimum). Example: $80 MSRP at 40% = $32. New items use these. Items you already saved keep their prices.</p>
+        <div id="pctRows" style="margin-top:12px"></div>
+        <div class="row"><button class="pri" id="savePct">Save percents</button></div>
+      </div>
+      <div class="card" id="flatCard">
         <h2 style="font-size:1.1rem">Flat price by MSRP</h2>
         <p class="hint">An item whose MSRP is at or under a line gets that line's flat price. Leave "Up to" blank on the last line to catch everything above. New items use these prices. Items you already saved keep their prices.</p>
         <div id="tierRows" style="margin-top:12px"></div>
@@ -173,6 +187,7 @@ setTimeout(()=>{
       </div>
       <div class="card">
         <button class="danger" id="logoutBtn">Sign out</button>
+        <p class="hint" id="verLine"></p>
       </div>
     </section>
   </main>
@@ -194,12 +209,14 @@ const firebaseConfig = {
   messagingSenderId: "292941889480",
   appId: "1:292941889480:web:e8440dcd53401477324afd"
 };
+const APP_VERSION = "2026-11-13.3";
 const CONFIGURED = !firebaseConfig.apiKey.startsWith("PASTE");
 
 const CATS = ["Kitchen & Dining","Small Appliances","Home Decor","Bedding & Bath","Furniture","Tools & Hardware","Electronics","Toys & Games","Clothing & Shoes","Health & Beauty","Baby","Pet Supplies","Outdoor & Garden","Sports & Fitness","Office & School","Automotive","Seasonal","Other"];
 const CONDS = [["N","New (sealed)","New"],["NO","New (open box)","New Open Box"],["LN","Used - like new","Used Like New"],["UG","Used - good","Used"],["UF","Used - fair","Used"],["P","For parts / not working","For Parts"]];
 const STATUSES = [["ready","Ready to list"],["listed","Listed"],["sold","Sold"],["gone","Donate / trash"]];
 const STATUS_LABEL = Object.fromEntries(STATUSES);
+const DEFAULT_PCT = {N:50,NO:40,LN:35,UG:25,UF:15,P:10};
 const DEFAULT_TIERS = [{max:25,price:5},{max:50,price:10},{max:100,price:20},{max:200,price:35},{max:400,price:60},{max:99999,price:90}];
 
 const $ = id => document.getElementById(id);
@@ -209,7 +226,7 @@ const numOrNull = v => { const n = parseFloat(v); return isNaN(n) ? null : n; };
 
 let db, auth;
 let items = [];
-let settings = { tiers: DEFAULT_TIERS };
+let settings = { mode: "pct", pct: { ...DEFAULT_PCT }, tiers: DEFAULT_TIERS };
 let editingSku = null;
 let priceTouched = false;
 let titleTouched = false;
@@ -228,8 +245,13 @@ function setSelect(el, opts, selected) {
   if (selected != null) el.value = selected;
 }
 
-function liquidPrice(msrp) {
+function liquidPrice(msrp, cond) {
   if (msrp == null) return null;
+  if (settings.mode === "pct") {
+    const pc = settings.pct[cond || "N"];
+    if (pc == null || isNaN(pc)) return null;
+    return Math.max(1, Math.round(msrp * pc / 100));
+  }
   for (const t of settings.tiers) if (msrp <= t.max) return t.price;
   return null;
 }
@@ -257,10 +279,12 @@ function regenTitle() {
 }
 function updatePriceHint() {
   const m = numOrNull($("fMsrp").value);
-  const p = liquidPrice(m);
+  const c = $("fCond").value;
+  const p = liquidPrice(m, c);
+  const how = settings.mode === "pct" ? `${settings.pct[c]}% of MSRP` : "Flat price for this MSRP";
   $("priceHint").textContent = m == null
-    ? "Enter the MSRP and the flat price fills in automatically."
-    : `Flat price for this MSRP: ${money(p)}. Type a different price to override it.`;
+    ? "Enter the MSRP and the price fills in automatically."
+    : `${how}: ${money(p)}. Type a different price to override it.`;
 }
 
 function readForm() {
@@ -304,7 +328,7 @@ function openEditor(item, pre = {}) {
   const built = buildTitle(titleInputs());
   $("fTitle").value = (item && d.title) ? d.title : built;
   titleTouched = !!(item && d.title && d.title !== built);
-  priceTouched = !!(item && d.price != null && d.price !== liquidPrice(d.msrp));
+  priceTouched = !!(item && d.price != null && d.price !== liquidPrice(d.msrp, d.cond || "N"));
   $("edTitle").textContent = item ? "Edit item" : "New item";
   $("edSku").textContent = item ? item.sku : "Tag number assigned on save";
   $("delBtn").hidden = !item;
@@ -351,7 +375,7 @@ async function saveItem() {
     return;
   }
   if (!f.title) f.title = buildTitle(f);
-  if (f.price == null) f.price = liquidPrice(f.msrp);
+  if (f.price == null) f.price = liquidPrice(f.msrp, f.cond);
   if (f.status === "sold" && f.soldPrice == null) f.soldPrice = f.price;
   const ts = firebase.firestore.FieldValue.serverTimestamp();
   $("saveBtn").disabled = true;
@@ -455,6 +479,24 @@ function printLabels() {
   setTimeout(() => w.print(), 400);
 }
 
+function renderMode() {
+  $("priceMode").value = settings.mode;
+  $("pctCard").hidden = settings.mode !== "pct";
+  $("flatCard").hidden = settings.mode !== "flat";
+  $("pctRows").innerHTML = CONDS.map(c => `<div class="tier" style="grid-template-columns:1fr 1fr">
+    <label>${esc(c[1])}</label>
+    <label>Percent of MSRP<input type="number" step="1" min="0" max="100" data-pc="${c[0]}" value="${settings.pct[c[0]] ?? ""}"></label>
+  </div>`).join("");
+}
+async function saveSetting(obj, msg) {
+  try {
+    await db.collection("config").doc("settings").set(obj, { merge: true });
+    Object.assign(settings, obj);
+    renderMode();
+    toast(msg);
+    updatePriceHint();
+  } catch (e) { toast("Couldn't save: " + e.message); }
+}
 function renderTiers() {
   $("tierRows").innerHTML = settings.tiers.map((t, ix) => `<div class="tier">
     <label>Up to MSRP $<input type="number" step="0.01" data-k="max" value="${t.max >= 99999 ? "" : t.max}" placeholder="and up"></label>
@@ -497,6 +539,9 @@ function startData() {
     settings.tiers = (d && Array.isArray(d.tiers))
       ? d.tiers.map(t => ({ max: +t.max, price: +t.price })).sort((a, b) => a.max - b.max)
       : DEFAULT_TIERS;
+    settings.mode = (d && d.mode === "flat") ? "flat" : "pct";
+    settings.pct = { ...DEFAULT_PCT, ...((d && d.pct) || {}) };
+    renderMode();
     renderTiers();
     updatePriceHint();
   }, e => toast("Can't load prices: " + e.message));
@@ -530,13 +575,15 @@ $("scanBox").addEventListener("keydown", e => {
     if (!titleTouched) { $("fTitle").value = buildTitle(titleInputs()); updateTitleCount(); }
   }));
 $("fTitle").addEventListener("input", () => { titleTouched = true; updateTitleCount(); });
-$("fMsrp").addEventListener("input", () => {
+function autoPrice() {
   if (!priceTouched) {
-    const p = liquidPrice(numOrNull($("fMsrp").value));
+    const p = liquidPrice(numOrNull($("fMsrp").value), $("fCond").value);
     $("fPrice").value = p == null ? "" : p.toFixed(2);
   }
   updatePriceHint();
-});
+}
+$("fMsrp").addEventListener("input", autoPrice);
+$("fCond").addEventListener("change", autoPrice);
 $("fPrice").addEventListener("input", () => { priceTouched = true; updatePriceHint(); });
 
 $("saveBtn").onclick = saveItem;
@@ -582,6 +629,16 @@ $("tierRows").addEventListener("click", e => {
   renderTiers();
 });
 $("saveTiers").onclick = saveTiers;
+$("saveMode").onclick = () => saveSetting({ mode: $("priceMode").value }, "Pricing method saved");
+$("savePct").onclick = () => {
+  const pct = {};
+  document.querySelectorAll("#pctRows [data-pc]").forEach(i => {
+    const n = parseFloat(i.value);
+    if (!isNaN(n)) pct[i.dataset.pc] = n;
+  });
+  if (Object.keys(pct).length < CONDS.length) { toast("Fill in a percent for every condition"); return; }
+  saveSetting({ pct }, "Percents saved");
+};
 
 $("loginBtn").onclick = async () => {
   try {
@@ -590,6 +647,22 @@ $("loginBtn").onclick = async () => {
 };
 $("loginPass").addEventListener("keydown", e => { if (e.key === "Enter") $("loginBtn").click(); });
 $("logoutBtn").onclick = () => auth.signOut();
+$("verLine").textContent = "App version " + APP_VERSION;
+const updateBar = document.createElement("div");
+updateBar.hidden = true;
+updateBar.textContent = "A new version of the app is ready. Click here to update.";
+updateBar.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:90;background:#0a7d4f;color:#fff;padding:14px;text-align:center;font-weight:600;cursor:pointer";
+updateBar.onclick = () => location.reload();
+document.body.appendChild(updateBar);
+async function checkUpdate() {
+  try {
+    const r = await fetch(location.pathname + "?v=" + Date.now(), { cache: "no-store" });
+    const m = (await r.text()).match(/const APP_VERSION = "([^"]+)"/);
+    if (m && m[1] !== APP_VERSION) updateBar.hidden = false;
+  } catch (e) {}
+}
+setInterval(checkUpdate, 3 * 60 * 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkUpdate(); });
 $("pwSave").onclick = async () => {
   const u = auth.currentUser;
   const oldP = $("pwOld").value, newP = $("pwNew").value;
