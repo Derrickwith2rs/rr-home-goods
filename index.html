@@ -140,6 +140,7 @@ setTimeout(()=>{
           <input id="search" placeholder="Search title, tag, UPC, bin…" style="flex:2;min-width:180px">
           <select id="statusFilter" style="flex:1;min-width:140px"></select>
           <button class="pri" id="printBtn">Print labels for checked</button>
+          <button id="exportBtn">Download list (CSV)</button>
         </div>
         <p class="hint" id="invCount"></p>
         <div class="tablewrap">
@@ -176,6 +177,12 @@ setTimeout(()=>{
         </div>
       </div>
       <div class="card">
+        <h2 style="font-size:1.1rem">Pallet manifests</h2>
+        <p class="hint">Upload the B-Stock manifest file (.csv) for each delivery. After that, scanning a barcode from that delivery fills in the brand, name, retail price and your price automatically.</p>
+        <input type="file" id="manFile" accept=".csv,text/csv" style="margin-top:10px">
+        <p class="hint" id="manInfo"></p>
+      </div>
+      <div class="card">
         <h2 style="font-size:1.1rem">Change my password</h2>
         <p class="hint" id="whoAmI"></p>
         <label>Current password<input type="password" id="pwOld" autocomplete="current-password"></label>
@@ -209,7 +216,7 @@ const firebaseConfig = {
   messagingSenderId: "292941889480",
   appId: "1:292941889480:web:e8440dcd53401477324afd"
 };
-const APP_VERSION = "2026-11-13.4";
+const APP_VERSION = "2026-11-13.5";
 const CONFIGURED = !firebaseConfig.apiKey.startsWith("PASTE");
 
 const CATS = ["Kitchen & Dining","Small Appliances","Home Decor","Bedding & Bath","Storage & Organization","Furniture","Tools & Hardware","Electronics","Toys & Games","Clothing & Shoes","Health & Beauty","Baby","Pet Supplies","Outdoor & Garden","Sports & Fitness","Office & School","Automotive","Seasonal","Other"];
@@ -231,7 +238,9 @@ let editingSku = null;
 let priceTouched = false;
 let titleTouched = false;
 const picked = new Set();
-let unsubItems = null, unsubSettings = null;
+let unsubItems = null, unsubSettings = null, unsubMan = null;
+let manifest = {};
+const normUpc = u => String(u || "").replace(/\D/g, "").replace(/^0+/, "");
 
 function toast(msg) {
   const t = $("toast");
@@ -348,10 +357,16 @@ function closeEditor() {
 
 function handleScan(code) {
   const up = code.toUpperCase();
-  const hit = items.find(i => i.sku === up) || items.find(i => i.upc && i.upc === code);
+  const nu = normUpc(code);
+  const hit = items.find(i => i.sku === up) || items.find(i => i.upc && (i.upc === code || (nu && normUpc(i.upc) === nu)));
+  const m = nu && manifest[nu];
   if (hit) {
     openEditor(hit);
     toast(`Found ${hit.sku}`);
+  } else if (m) {
+    openEditor(null, { upc: code, brand: m.brand, type: m.type, msrp: m.msrp, pallet: m.pallet,
+                       price: liquidPrice(m.msrp, "N") });
+    toast("Found on the manifest. Check condition and quantity, then save.");
   } else {
     openEditor(null, { upc: code });
     toast("New item. Fill in brand and item type.");
@@ -429,7 +444,7 @@ function renderInv() {
     <td class="num">${esc(i.qty || 1)}</td>
     <td class="num"><b>${money(i.status === "sold" ? (i.soldPrice ?? i.price) : i.price)}</b><div class="sub">MSRP ${money(i.msrp)}</div></td>
     <td>${esc(STATUS_LABEL[i.status] || i.status)}</td>
-    <td><button data-edit="${esc(i.sku)}">Edit</button> ${i.status !== "sold" ? `<button data-sold="${esc(i.sku)}">Sold</button>` : ""}</td>
+    <td><button data-edit="${esc(i.sku)}">Edit</button> <button data-copy="${esc(i.sku)}">Copy title</button> ${i.status !== "sold" ? `<button data-sold="${esc(i.sku)}">Sold</button>` : ""}</td>
   </tr>`).join("") || `<tr><td colspan="7" class="sub">No items match.</td></tr>`;
   $("invCount").textContent = `${rows.length} shown · ${picked.size} checked for labels`;
 }
@@ -497,6 +512,88 @@ async function saveSetting(obj, msg) {
     updatePriceHint();
   } catch (e) { toast("Couldn't save: " + e.message); }
 }
+function parseCSV(text) {
+  const rows = []; let row = [], cur = "", q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+      else cur += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") { row.push(cur); cur = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(cur); cur = "";
+      if (row.some(x => x !== "")) rows.push(row);
+      row = [];
+    } else cur += c;
+  }
+  row.push(cur);
+  if (row.some(x => x !== "")) rows.push(row);
+  return rows;
+}
+function cleanManifest(brandRaw, descRaw) {
+  let desc = String(descRaw || "").replace(/\s*\(Please be advised[^)]*\)/i, "").replace(/[\u2122\u00ae]/g, "").trim();
+  const parts = String(brandRaw || "").replace(/[\u2122\u00ae]/g, "").split(";").map(x => x.trim()).filter(Boolean);
+  let brand = parts.find(b => desc.toLowerCase().startsWith(b.toLowerCase())) || parts[0] || "";
+  if (brand && desc.toLowerCase().startsWith(brand.toLowerCase() + " ")) desc = desc.slice(brand.length + 1);
+  let type = desc.split(": ")[0];
+  const dash = type.lastIndexOf(" - ");
+  if (dash > 0) {
+    const tail = type.slice(dash + 3).trim();
+    if (!brand && tail.split(" ").length <= 3) { brand = tail; type = type.slice(0, dash); }
+    else if (brand && tail.toLowerCase().includes(brand.toLowerCase().split(" ")[0])) type = type.slice(0, dash);
+  }
+  if (brand) {
+    const ix = type.toLowerCase().indexOf(brand.toLowerCase() + " ");
+    if (ix >= 0) type = type.slice(0, ix) + type.slice(ix + brand.length + 1);
+  }
+  return { brand: brand.replace(/:/g, ""), type: type.replace(/\s+/g, " ").trim() };
+}
+async function loadManifestFile(file) {
+  const rows = parseCSV((await file.text()).replace(/^\ufeff/, ""));
+  if (rows.length < 2) { toast("That file looks empty"); return; }
+  const head = rows[0].map(h => h.trim().toLowerCase());
+  const col = n => head.indexOf(n);
+  const cU = col("upc"), cD = col("item description"), cR = col("unit retail"),
+        cB = col("brand"), cP = col("pallet id"), cQ = col("qty"), cL = col("lot id");
+  if (cU < 0 || cD < 0 || cR < 0) { toast("This file needs UPC, Item Description and Unit Retail columns"); return; }
+  const lot = file.name.replace(/\.csv$/i, "").slice(0, 120);
+  const map = {};
+  for (const r of rows.slice(1)) {
+    const id = normUpc(r[cU]);
+    const msrp = parseFloat(String(r[cR] || "").replace(/[$,]/g, ""));
+    if (!id || isNaN(msrp)) continue;
+    const qty = parseInt(r[cQ], 10) || 1;
+    if (map[id]) { map[id].qty += qty; continue; }
+    map[id] = { ...cleanManifest(cB >= 0 ? r[cB] : "", r[cD]), upc: String(r[cU]).trim(), msrp, qty,
+                pallet: cP >= 0 ? String(r[cP] || "").trim() : "", lot: (cL >= 0 && r[cL]) || lot };
+  }
+  const ids = Object.keys(map);
+  if (!ids.length) { toast("No usable rows found in that file"); return; }
+  try {
+    for (let i = 0; i < ids.length; i += 400) {
+      const b = db.batch();
+      ids.slice(i, i + 400).forEach(id => b.set(db.collection("manifest").doc(id), map[id]));
+      await b.commit();
+    }
+    toast(`Manifest loaded: ${ids.length} products`);
+  } catch (e) { toast("Couldn't load manifest: " + e.message); }
+}
+function exportCSV() {
+  const cols = [["Tag","sku"],["Title","title"],["Price","price"],["Qty","qty"],["Condition","cond"],["Brand","brand"],
+                ["UPC","upc"],["MSRP","msrp"],["Category","category"],["Status","status"],["Pallet","pallet"],["Bin","bin"],["Notes","notes"]];
+  const condName = Object.fromEntries(CONDS.map(c => [c[0], c[1]]));
+  const cell = v => { v = String(v ?? ""); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  const lines = [cols.map(c => c[0]).join(",")];
+  [...items].sort((a, b) => a.sku.localeCompare(b.sku)).forEach(i =>
+    lines.push(cols.map(([, k]) => cell(k === "cond" ? condName[i.cond] : k === "status" ? (STATUS_LABEL[i.status] || i.status) : k === "upc" ? (i.upc ? "'" + i.upc : "") : i[k])).join(",")));
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob(["\ufeff" + lines.join("\r\n")], { type: "text/csv" }));
+  a.download = "rr-home-goods-inventory.csv";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
 function renderTiers() {
   $("tierRows").innerHTML = settings.tiers.map((t, ix) => `<div class="tier">
     <label>Up to MSRP $<input type="number" step="0.01" data-k="max" value="${t.max >= 99999 ? "" : t.max}" placeholder="and up"></label>
@@ -547,9 +644,22 @@ function startData() {
   }, e => toast("Can't load prices: " + e.message));
 }
 
+function startManifest() {
+  unsubMan = db.collection("manifest").onSnapshot(s => {
+    manifest = {};
+    s.docs.forEach(d => manifest[d.id] = d.data());
+    const lots = new Set(s.docs.map(d => d.data().lot)).size;
+    $("manInfo").textContent = s.size
+      ? `${s.size} products on file from ${lots} manifest${lots === 1 ? "" : "s"}.`
+      : "No manifest loaded yet.";
+  }, e => toast("Can't load manifest: " + e.message));
+}
+
 function stopData() {
   if (unsubItems) { unsubItems(); unsubItems = null; }
   if (unsubSettings) { unsubSettings(); unsubSettings = null; }
+  if (unsubMan) { unsubMan(); unsubMan = null; }
+  manifest = {};
   items = [];
 }
 
@@ -602,9 +712,20 @@ $("delBtn").onclick = async () => {
 $("search").addEventListener("input", renderInv);
 $("statusFilter").addEventListener("change", renderInv);
 $("printBtn").onclick = printLabels;
+$("exportBtn").onclick = exportCSV;
+$("manFile").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (f) await loadManifestFile(f);
+  e.target.value = "";
+});
 $("invBody").addEventListener("click", e => {
   const ed = e.target.closest("[data-edit]");
   const so = e.target.closest("[data-sold]");
+  const cp = e.target.closest("[data-copy]");
+  if (cp) {
+    const it = items.find(i => i.sku === cp.dataset.copy);
+    navigator.clipboard.writeText(it.title || "").then(() => toast("Title copied"), () => toast("Couldn't copy"));
+  }
   if (ed) openEditor(items.find(i => i.sku === ed.dataset.edit));
   if (so) markSold(so.dataset.sold);
 });
@@ -690,6 +811,7 @@ function init() {
       $("app").hidden = false;
       $("whoAmI").textContent = "Signed in as " + user.email;
       startData();
+      if (!unsubMan) startManifest();
     } else {
       $("app").hidden = true;
       $("login").hidden = false;
