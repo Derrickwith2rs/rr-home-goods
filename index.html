@@ -162,6 +162,16 @@ setTimeout(()=>{
         </div>
       </div>
       <div class="card">
+        <h2 style="font-size:1.1rem">Change my password</h2>
+        <p class="hint" id="whoAmI"></p>
+        <label>Current password<input type="password" id="pwOld" autocomplete="current-password"></label>
+        <label>New password (6 or more characters)<input type="password" id="pwNew" autocomplete="new-password"></label>
+        <label>New password again<input type="password" id="pwNew2" autocomplete="new-password"></label>
+        <div class="row">
+          <button class="pri" id="pwSave">Change password</button>
+        </div>
+      </div>
+      <div class="card">
         <button class="danger" id="logoutBtn">Sign out</button>
       </div>
     </section>
@@ -580,6 +590,21 @@ $("loginBtn").onclick = async () => {
 };
 $("loginPass").addEventListener("keydown", e => { if (e.key === "Enter") $("loginBtn").click(); });
 $("logoutBtn").onclick = () => auth.signOut();
+$("pwSave").onclick = async () => {
+  const u = auth.currentUser;
+  const oldP = $("pwOld").value, newP = $("pwNew").value;
+  if (!u) return;
+  if (newP.length < 6) { toast("New password needs 6 or more characters"); return; }
+  if (newP !== $("pwNew2").value) { toast("The two new passwords don't match"); return; }
+  try {
+    await u.reauthenticateWithCredential(firebase.auth.EmailAuthProvider.credential(u.email, oldP));
+    await u.updatePassword(newP);
+    $("pwOld").value = $("pwNew").value = $("pwNew2").value = "";
+    toast("Password changed");
+  } catch (e) {
+    toast(/wrong-password|invalid-credential|invalid-login/.test(e.code || "") ? "Current password is wrong" : "Couldn't change: " + e.message);
+  }
+};
 
 function init() {
   if (!CONFIGURED) { $("setupMsg").hidden = false; return; }
@@ -590,6 +615,7 @@ function init() {
     if (user) {
       $("login").hidden = true;
       $("app").hidden = false;
+      $("whoAmI").textContent = "Signed in as " + user.email;
       startData();
     } else {
       $("app").hidden = true;
