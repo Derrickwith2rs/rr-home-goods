@@ -209,10 +209,10 @@ const firebaseConfig = {
   messagingSenderId: "292941889480",
   appId: "1:292941889480:web:e8440dcd53401477324afd"
 };
-const APP_VERSION = "2026-11-13.3";
+const APP_VERSION = "2026-11-13.4";
 const CONFIGURED = !firebaseConfig.apiKey.startsWith("PASTE");
 
-const CATS = ["Kitchen & Dining","Small Appliances","Home Decor","Bedding & Bath","Furniture","Tools & Hardware","Electronics","Toys & Games","Clothing & Shoes","Health & Beauty","Baby","Pet Supplies","Outdoor & Garden","Sports & Fitness","Office & School","Automotive","Seasonal","Other"];
+const CATS = ["Kitchen & Dining","Small Appliances","Home Decor","Bedding & Bath","Storage & Organization","Furniture","Tools & Hardware","Electronics","Toys & Games","Clothing & Shoes","Health & Beauty","Baby","Pet Supplies","Outdoor & Garden","Sports & Fitness","Office & School","Automotive","Seasonal","Other"];
 const CONDS = [["N","New (sealed)","New"],["NO","New (open box)","New Open Box"],["LN","Used - like new","Used Like New"],["UG","Used - good","Used"],["UF","Used - fair","Used"],["P","For parts / not working","For Parts"]];
 const STATUSES = [["ready","Ready to list"],["listed","Listed"],["sold","Sold"],["gone","Donate / trash"]];
 const STATUS_LABEL = Object.fromEntries(STATUSES);
