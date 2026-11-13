@@ -44,6 +44,23 @@ td.num,th.num{text-align:right;white-space:nowrap}
 </style>
 </head>
 <body>
+<script>
+function showDiag(t){
+  let d=document.getElementById("diag");
+  if(!d){d=document.createElement("pre");d.id="diag";d.style.cssText="position:fixed;top:0;left:0;right:0;margin:0;padding:10px;background:#fff3cd;color:#000;font:13px monospace;white-space:pre-wrap;z-index:99";document.body.appendChild(d);}
+  d.textContent+=t+"
+";
+}
+window.addEventListener("error",e=>{
+  const who=(e.target&&e.target.src)?"Failed to load: "+e.target.src:(e.message||"Script error");
+  showDiag(who+(e.lineno?" (line "+e.lineno+")":""));
+},true);
+window.addEventListener("unhandledrejection",e=>showDiag("Promise error: "+((e.reason&&e.reason.message)||e.reason)));
+setTimeout(()=>{
+  const g=id=>document.getElementById(id);
+  if(g("app")&&g("app").hidden&&g("login").hidden&&g("setupMsg").hidden) showDiag("Still starting after 6 seconds. Sign-in screen never appeared.");
+},6000);
+</script>
 
 <div id="setupMsg" class="overlay" hidden>
   <div class="card">
